@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from typing import Any
 from . import db
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .rules import InvalidRulePattern, compile_pattern, select_rules
 
 STATUS_PENDING = "pending"
 STATUS_RESOLVED = "resolved"
@@ -268,3 +270,99 @@ def preview_resolutions(
         preview["patch"] = generate_patch(base, document)
         preview["result_sha256"] = sha256_hex(document)
     return preview
+
+
+def apply_rule_resolutions(
+    merge_id: str, expected_revision: int, rules: list[dict]
+) -> dict:
+    """Resolve open conflicts with ordered pointer-pattern rules.
+
+    For every open conflict the unique winning rule is chosen (more literal
+    segments, then fewer wildcard segments, then earlier declaration). All
+    pattern strings are compiled first and every hit is validated/applied
+    on an in-memory copy before anything is written; any invalid pattern
+    or un-applicable choice aborts the request without partial changes.
+    On success a single UPDATE commits the outcome and the revision is
+    bumped exactly once (also when no conflict was matched).
+
+    Raises StaleRevision (409) for a wrong revision, AlreadyResolved (409)
+    on a finished merge and InvalidRulePattern/InvalidResolution (400) for
+    bad patterns or un-applicable choices.
+    """
+    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(merge_id)
+    if row["revision"] != expected_revision:
+        raise StaleRevision(row["revision"])
+
+    # Step 1: compile *every* pattern. A single bad pattern aborts before
+    # any conflict is touched, so the declared rules are never applied
+    # half-way.
+    compiled: list[tuple[int, Any, str]] = [
+        (idx, compile_pattern(rule.get("pattern")), rule["choice"])
+        for idx, rule in enumerate(rules)
+    ]
+
+    conflicts = json.loads(row["conflicts"])
+    assignments, hits, unmatched = select_rules(conflicts, compiled)
+
+    document = json.loads(row["document"])
+    open_conflicts = {c["pointer"]: c for c in conflicts}
+
+    # Step 2: validate every hit up front on a deep copy: a chosen missing
+    # side deletes the key (including the root conflict case, which is
+    # rejected). Only after all hits are known applicable do we mutate.
+    scratch = copy.deepcopy(document)
+    for pointer, assignment in assignments.items():
+        conflict = open_conflicts[pointer]
+        choice = assignment["choice"]
+        tokens = parse_pointer(pointer)
+        if choice in conflict["missing"]:
+            if not tokens:
+                raise InvalidResolution(
+                    "cannot resolve a root conflict by choosing a missing side"
+                )
+            delete_at(scratch, tokens)
+        elif not tokens:
+            # The whole document is the conflict: adopt the side verbatim.
+            scratch = copy.deepcopy(conflict[choice])
+        else:
+            set_at(scratch, tokens, conflict[choice])
+
+    remaining = [c for c in conflicts if c["pointer"] not in assignments]
+
+    # Step 3: one transactional commit, one revision bump — regardless of
+    # how many rules/hits the request carried.
+    document = scratch
+    resolved = not remaining
+    db.execute(
+        """
+        UPDATE merges
+        SET status = ?, revision = revision + 1, document = ?,
+            conflicts = ?, result = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            STATUS_RESOLVED if resolved else STATUS_PENDING,
+            json.dumps(document),
+            json.dumps(remaining),
+            json.dumps(document) if resolved else None,
+            _now(),
+            merge_id,
+        ),
+    )
+
+    view = get_merge(merge_id)
+    view["matched_rules"] = [
+        {
+            "rule_index": idx,
+            "pattern": cp.pattern,
+            "choice": choice,
+            "pointers": hits[idx],
+        }
+        for idx, cp, choice in compiled
+    ]
+    view["unmatched_conflicts"] = unmatched
+    return view

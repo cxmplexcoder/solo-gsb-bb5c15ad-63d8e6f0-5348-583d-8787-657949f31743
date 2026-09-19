@@ -8,7 +8,8 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import db, store
-from .models import MergeCreate, ResolveRequest
+from .models import MergeCreate, ResolveRequest, RuleResolutionRequest
+from .rules import InvalidRulePattern
 
 
 @asynccontextmanager
@@ -68,6 +69,11 @@ async def unknown_pointer_handler(request: Request, exc: store.UnknownConflictPo
 
 @app.exception_handler(store.InvalidResolution)
 async def invalid_resolution_handler(request: Request, exc: store.InvalidResolution):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(InvalidRulePattern)
+async def invalid_rule_pattern_handler(request: Request, exc: InvalidRulePattern):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
@@ -145,3 +151,22 @@ def preview_resolution(merge_id: str, body: ResolveRequest):
     SHA-256 are included.
     """
     return store.preview_resolutions(merge_id, body.revision, _resolution_items(body))
+
+
+@app.post("/merges/{merge_id}/rule-resolutions")
+def resolve_with_rules(merge_id: str, body: RuleResolutionRequest):
+    """Resolve open conflicts in one shot using ordered pointer patterns.
+
+    Every rule gives an RFC 6901-style ``pattern`` (single-segment ``*``,
+    trailing ``**``) and a ``choice``. For each open conflict the unique
+    winning rule is selected (more literal segments, fewer wildcards,
+    earlier declaration); the response lists the pointers hit by each
+    rule plus the conflicts no rule matched. All hits are validated
+    before anything is written: an invalid pattern or an un-applicable
+    choice fails the whole request with 400 and no partial modification.
+    A chosen-but-missing side honours the deletion. On success the
+    outcome commits in one transaction and the revision bumps once; a
+    stale revision fails with 409.
+    """
+    rules = [{"pattern": r.pattern, "choice": r.choice} for r in body.rules]
+    return store.apply_rule_resolutions(merge_id, body.revision, rules)

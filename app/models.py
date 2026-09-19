@@ -36,3 +36,23 @@ class ResolveRequest(BaseModel):
     resolutions: list[ResolutionItem] = Field(
         ..., min_length=1, description="Batch of conflict resolutions"
     )
+
+
+class RuleItem(BaseModel):
+    pattern: str = Field(
+        ...,
+        description=(
+            "RFC 6901-style pointer pattern; '*' matches one segment and a "
+            "trailing '**' matches zero or more remaining segments"
+        ),
+    )
+    choice: Literal["left", "right"] = Field(
+        ..., description="Side every conflict matched by this rule takes"
+    )
+
+
+class RuleResolutionRequest(BaseModel):
+    revision: int = Field(..., description="Current merge revision (409 if stale)")
+    rules: list[RuleItem] = Field(
+        ..., min_length=1, description="Ordered rules; earlier declarations win ties"
+    )

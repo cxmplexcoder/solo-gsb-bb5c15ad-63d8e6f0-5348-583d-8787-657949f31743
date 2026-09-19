@@ -388,3 +388,426 @@ def test_patch_for_immediately_resolved_merge(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def _multi_conflict_merge(client):
+    """Merge with conflicts at /db/host, /db/tls/cert and /cache/size."""
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {
+                "db": {"host": "a", "tls": {"cert": "base.pem"}},
+                "cache": {"size": 10},
+            },
+            "left": {
+                "db": {"host": "b", "tls": {"cert": "left.pem"}},
+                "cache": {"size": 20},
+            },
+            "right": {
+                "db": {"host": "c", "tls": {"cert": "right.pem"}},
+                "cache": {"size": 30},
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_rule_resolutions_match_and_commit_once(client):
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+    pointers = sorted(c["pointer"] for c in merge["conflicts"])
+    assert pointers == ["/cache/size", "/db/host", "/db/tls/cert"]
+
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [
+                {"pattern": "/db/host", "choice": "left"},
+                {"pattern": "/db/**", "choice": "right"},
+                {"pattern": "/*/size", "choice": "left"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "resolved"
+    # Exactly one revision bump for the whole rule batch.
+    assert body["revision"] == 2
+    assert body["conflicts"] == []
+    assert body["unmatched_conflicts"] == []
+
+    # Each rule reports the pointers it won (order irrelevant).
+    by_index = {r["rule_index"]: r for r in body["matched_rules"]}
+    assert by_index[0]["pattern"] == "/db/host"
+    assert by_index[0]["pointers"] == ["/db/host"]
+    assert by_index[1]["pattern"] == "/db/**"
+    assert by_index[1]["pointers"] == ["/db/tls/cert"]
+    assert by_index[2]["pattern"] == "/*/size"
+    assert by_index[2]["pointers"] == ["/cache/size"]
+
+    # Choices landed in the immutable result.
+    result = body["result"]
+    assert result["db"]["host"] == "b"
+    assert result["db"]["tls"]["cert"] == "right.pem"
+    assert result["cache"]["size"] == 20
+
+    # Result is immutable afterwards.
+    again = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={"revision": 2, "rules": [{"pattern": "/**", "choice": "left"}]},
+    )
+    assert again.status_code == 409
+
+
+def test_rule_specificity_order(client):
+    """More literals win, then fewer '*', then declaration order."""
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [
+                {"pattern": "/**", "choice": "right"},
+                {"pattern": "/db/**", "choice": "left"},
+                {"pattern": "/db/*", "choice": "right"},
+                {"pattern": "/db/host", "choice": "left"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    winners = {r["rule_index"]: sorted(r["pointers"]) for r in body["matched_rules"]}
+    # Exact literal beats all wildcards -> /db/host via rule 3.
+    assert winners[3] == ["/db/host"]
+    # /db/* has only two segments and cannot match /db/tls/cert; that
+    # conflict goes to /db/** (more literals than the bare /**).
+    assert winners[2] == []
+    assert winners[1] == ["/db/tls/cert"]
+    assert winners[0] == ["/cache/size"]
+
+    result = body["result"]
+    assert result["db"]["host"] == "b"  # rule 3 left
+    assert result["db"]["tls"]["cert"] == "left.pem"  # rule 1 left
+    assert result["cache"]["size"] == 30  # rule 0 right
+
+
+def test_rule_identical_patterns_use_declaration_order(client):
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [
+                {"pattern": "/db/*", "choice": "left"},
+                {"pattern": "/db/*", "choice": "right"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Only /db/host is directly under /db; /db/tls/cert is two levels
+    # down and stays unmatched. The earlier rule wins the one hit.
+    winners = {r["rule_index"]: r["pointers"] for r in body["matched_rules"]}
+    assert winners[0] == ["/db/host"]
+    assert winners[1] == []
+    assert sorted(c["pointer"] for c in body["unmatched_conflicts"]) == [
+        "/cache/size",
+        "/db/tls/cert",
+    ]
+    assert body["status"] == "pending"
+    assert body["revision"] == 2
+    assert body["result"] is None
+
+
+def test_rule_unmatched_conflicts_remain_open(client):
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [{"pattern": "/db/host", "choice": "right"}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    # One revision bump for the batch; two conflicts left.
+    assert body["revision"] == 2
+    assert sorted(c["pointer"] for c in body["conflicts"]) == [
+        "/cache/size",
+        "/db/tls/cert",
+    ]
+    assert sorted(c["pointer"] for c in body["unmatched_conflicts"]) == [
+        "/cache/size",
+        "/db/tls/cert",
+    ]
+    assert body["document"]["db"]["host"] == "c"
+    assert body["document"]["db"]["tls"]["cert"] == {
+        "__merge_conflict__": "/db/tls/cert"
+    }
+
+    # The remainder can be finished with the ordinary pointer endpoint.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 2,
+            "resolutions": [
+                {"pointer": "/cache/size", "value": 99},
+                {"pointer": "/db/tls/cert", "choice": "left"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "resolved"
+    assert resp.json()["revision"] == 3
+
+
+def test_rule_no_match_still_bumps_revision_once(client):
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [{"pattern": "/nonexistent/*", "choice": "left"}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["revision"] == 2
+    assert body["matched_rules"][0]["pointers"] == []
+    assert len(body["unmatched_conflicts"]) == 3
+    # No document change: placeholders are still in place.
+    assert body["document"]["db"]["host"] == {"__merge_conflict__": "/db/host"}
+
+    # The old revision is now stale.
+    stale = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={"revision": 1, "rules": [{"pattern": "/**", "choice": "left"}]},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["current_revision"] == 2
+
+
+def test_rule_stale_revision_returns_409(client):
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 999,
+            "rules": [{"pattern": "/db/host", "choice": "left"}],
+        },
+    )
+    assert resp.status_code == 409
+    assert resp.json()["current_revision"] == 1
+    # Nothing applied.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+
+
+def test_rule_unknown_merge_404(client):
+    resp = client.post(
+        "/merges/does-not-exist/rule-resolutions",
+        json={"revision": 1, "rules": [{"pattern": "/**", "choice": "left"}]},
+    )
+    assert resp.status_code == 404
+
+
+def test_rule_missing_side_honours_deletion(client):
+    # left deletes /a, right modifies it -> conflict with missing side.
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"b": 1},
+            "right": {"a": 9, "b": 2},
+        },
+    )
+    mid = resp.json()["merge_id"]
+    assert {c["pointer"]: c["missing"] for c in resp.json()["conflicts"]} == {
+        "/a": ["left"]
+    }
+    # Choosing the deleting side removes the key...
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={"revision": 1, "rules": [{"pattern": "/*", "choice": "left"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # /* matches only one segment: /a is removed (deletion), /b stays
+    # untouched because it was never in conflict.
+    assert body["status"] == "resolved"
+    assert body["result"] == {"b": 2}
+
+
+def test_rule_invalid_pattern_400_without_changes(client):
+    merge = _multi_conflict_merge(client)
+    mid = merge["merge_id"]
+
+    for bad_pattern in [
+        "db/host",        # missing leading slash
+        "/db/host-*",     # '*' not a whole segment
+        "/db/**/host",    # '**' not the final segment
+        "/db/ho~st",      # bad '~' escape
+    ]:
+        resp = client.post(
+            f"/merges/{mid}/rule-resolutions",
+            json={"revision": 1, "rules": [{"pattern": bad_pattern, "choice": "left"}]},
+        )
+        assert resp.status_code == 400, (bad_pattern, resp.text)
+
+    # Even one bad rule among many aborts everything.
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [
+                {"pattern": "/db/host", "choice": "left"},
+                {"pattern": "**", "choice": "right"},
+            ],
+        },
+    )
+    assert resp.status_code == 400
+
+    # Empty rule list is a schema error (422), not a silent success.
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={"revision": 1, "rules": []},
+    )
+    assert resp.status_code == 422
+
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert len(fetched["conflicts"]) == 3
+
+
+def test_rule_one_unapplicable_choice_aborts_all(client):
+    """All hits validate first; failure leaves zero partial changes.
+
+    A root conflict resolved by choosing a missing side would require
+    deleting the whole document, which is rejected. The API cannot create
+    such a state through normal input, so seed the row directly.
+    """
+    from app import db
+    from app.store import STATUS_PENDING
+
+    merge_id = "seeded-root-conflict"
+    now = "2026-01-01T00:00:00+00:00"
+    conflict = {
+        "pointer": "",
+        "base": {"keep": 1},
+        "left": None,
+        "right": {"keep": 2},
+        "missing": ["left"],
+    }
+    db.execute(
+        """
+        INSERT INTO merges (
+            id, idempotency_key, status, revision,
+            base_doc, left_doc, right_doc,
+            document, conflicts, result, created_at, updated_at
+        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        """,
+        (
+            merge_id,
+            STATUS_PENDING,
+            1,
+            json_dumps({"keep": 1}),
+            json_dumps({"keep": 1}),
+            json_dumps({"keep": 2}),
+            json_dumps({"__merge_conflict__": ""}),
+            json_dumps([conflict]),
+            now,
+            now,
+        ),
+    )
+
+    # Two rules hit: root via ** and nothing else. Choosing the missing
+    # left side must fail the whole batch as 400.
+    resp = client.post(
+        f"/merges/{merge_id}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [
+                {"pattern": "/something", "choice": "right"},
+                {"pattern": "/**", "choice": "left"},
+            ],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+
+    fetched = client.get(f"/merges/{merge_id}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert fetched["conflicts"] == [conflict]
+    assert fetched["document"] == {"__merge_conflict__": ""}
+
+    # The same conflict is resolvable by choosing the present side.
+    resp = client.post(
+        f"/merges/{merge_id}/rule-resolutions",
+        json={"revision": 1, "rules": [{"pattern": "/**", "choice": "right"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == {"keep": 2}
+
+
+def json_dumps(value):
+    import json
+
+    return json.dumps(value)
+
+
+def test_rule_double_star_zero_segment_match(client):
+    # A conflict directly at /db is matched by /db/** (zero tail segments).
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"db": {"host": "a"}},
+            "left": {"db": {"host": "b"}},
+            "right": {"db": {"host": "c"}},
+        },
+    )
+    mid = resp.json()["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={"revision": 1, "rules": [{"pattern": "/db/**", "choice": "right"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["matched_rules"][0]["pointers"] == ["/db/host"]
+    assert resp.json()["result"]["db"]["host"] == "c"
+
+
+def test_rule_escaped_literal_pattern(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a/b": 1},
+            "left": {"a/b": 2},
+            "right": {"a/b": 3},
+        },
+    )
+    mid = resp.json()["merge_id"]
+    assert resp.json()["conflicts"][0]["pointer"] == "/a~1b"
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={
+            "revision": 1,
+            "rules": [
+                {"pattern": "/*", "choice": "right"},
+                {"pattern": "/a~1b", "choice": "left"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    # Literal pattern beats the single-star wildcard.
+    assert resp.json()["result"] == {"a/b": 2}
