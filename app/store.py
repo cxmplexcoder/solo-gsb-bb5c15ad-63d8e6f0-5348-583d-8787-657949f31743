@@ -7,9 +7,18 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import db
+from . import db, rules
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .rules import (
+    InvalidPattern,
+    InvalidRuleSet,
+    RuleApplicationFailed,
+    apply_plan,
+    compile_rules,
+    group_matches,
+    plan_resolutions,
+)
 
 STATUS_PENDING = "pending"
 STATUS_RESOLVED = "resolved"
@@ -268,3 +277,67 @@ def preview_resolutions(
         preview["patch"] = generate_patch(base, document)
         preview["result_sha256"] = sha256_hex(document)
     return preview
+
+
+def apply_rule_resolutions(
+    merge_id: str, expected_revision: int, rule_items: list[dict]
+) -> dict:
+    """Resolve open conflicts with ordered path-pattern rules.
+
+    Every open conflict is matched against the ordered rules and the unique
+    best match (more literal segments, then fewer '*', then declaration
+    order) supplies its side. All hits are validated before any write: an
+    invalid pattern, a rule without any pattern or a failure applying a
+    hit rejects the whole request with no partial modification. The
+    revision is bumped at most once, inside the single UPDATE transaction.
+    """
+    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(merge_id)
+    if row["revision"] != expected_revision:
+        raise StaleRevision(row["revision"])
+
+    # Compiling and planning happens entirely in memory; nothing is touched
+    # until every selected conflict has been proven applicable.
+    compiled_rules = compile_rules(rule_items)
+    conflicts = json.loads(row["conflicts"])
+    winners = plan_resolutions(conflicts, compiled_rules)
+    rule_matches = group_matches(winners)
+    unmatched = [c["pointer"] for c in conflicts if c["pointer"] not in {w.pointer for w in winners}]
+
+    if not winners:
+        # Nothing matched: nothing to validate or apply, no state change and
+        # no revision bump; the unmatched conflicts are reported back.
+        view = get_merge(merge_id)
+        view["rule_matches"] = []
+        view["unmatched_conflicts"] = unmatched
+        view["applied"] = False
+        return view
+
+    document, remaining = apply_plan(json.loads(row["document"]), conflicts, winners)
+    resolved = not remaining
+
+    # Single atomic update: revision increments exactly once.
+    db.execute(
+        """
+        UPDATE merges
+        SET status = ?, revision = revision + 1, document = ?,
+            conflicts = ?, result = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            STATUS_RESOLVED if resolved else STATUS_PENDING,
+            json.dumps(document),
+            json.dumps(remaining),
+            json.dumps(document) if resolved else None,
+            _now(),
+            merge_id,
+        ),
+    )
+    view = get_merge(merge_id)
+    view["rule_matches"] = rule_matches
+    view["unmatched_conflicts"] = unmatched
+    view["applied"] = True
+    return view

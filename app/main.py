@@ -8,7 +8,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import db, store
-from .models import MergeCreate, ResolveRequest
+from .models import MergeCreate, ResolveRequest, RuleResolveRequest
 
 
 @asynccontextmanager
@@ -69,6 +69,28 @@ async def unknown_pointer_handler(request: Request, exc: store.UnknownConflictPo
 @app.exception_handler(store.InvalidResolution)
 async def invalid_resolution_handler(request: Request, exc: store.InvalidResolution):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(store.InvalidPattern)
+async def invalid_pattern_handler(request: Request, exc: store.InvalidPattern):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(store.InvalidRuleSet)
+async def invalid_ruleset_handler(request: Request, exc: store.InvalidRuleSet):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(store.RuleApplicationFailed)
+async def rule_apply_failed_handler(request: Request, exc: store.RuleApplicationFailed):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": str(exc),
+            "pointer": exc.pointer,
+            "reason": exc.reason,
+        },
+    )
 
 
 @app.get("/health")
@@ -145,3 +167,22 @@ def preview_resolution(merge_id: str, body: ResolveRequest):
     SHA-256 are included.
     """
     return store.preview_resolutions(merge_id, body.revision, _resolution_items(body))
+
+
+@app.post("/merges/{merge_id}/rule-resolutions")
+def resolve_by_rules(merge_id: str, body: RuleResolveRequest):
+    """Resolve conflicts in bulk via ordered RFC 6901-style path patterns.
+
+    Each rule may give a ``left`` and/or ``right`` pattern (single-segment
+    ``*`` and trailing ``**`` supported). Every open conflict is assigned
+    its unique best match — more literal segments first, then fewer ``*``,
+    then declaration order. All hits are validated first; only when every
+    one is applicable do they commit in a single transaction with exactly
+    one revision bump. A missing chosen side honours the deletion. Stale
+    revision or a resolved merge yields 409; an invalid pattern or failed
+    application yields 400 with no partial modification.
+    """
+    rule_items = [
+        {"left": rule.left, "right": rule.right} for rule in body.rules
+    ]
+    return store.apply_rule_resolutions(merge_id, body.revision, rule_items)

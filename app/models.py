@@ -36,3 +36,27 @@ class ResolveRequest(BaseModel):
     resolutions: list[ResolutionItem] = Field(
         ..., min_length=1, description="Batch of conflict resolutions"
     )
+
+
+class RuleItem(BaseModel):
+    left: str | None = Field(
+        default=None,
+        description=(
+            "RFC 6901-style path pattern; matched conflicts take the left "
+            "candidate. Supports a single '*' segment and a trailing '**'."
+        ),
+    )
+    right: str | None = Field(
+        default=None,
+        description=(
+            "RFC 6901-style path pattern; matched conflicts take the right "
+            "candidate. Supports a single '*' segment and a trailing '**'."
+        ),
+    )
+
+
+class RuleResolveRequest(BaseModel):
+    revision: int = Field(..., description="Current merge revision (409 if stale)")
+    rules: list[RuleItem] = Field(
+        ..., min_length=1, description="Ordered resolution rules (first one wins ties)"
+    )

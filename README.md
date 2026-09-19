@@ -44,6 +44,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值 |
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
+| `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
@@ -151,7 +152,66 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 - 任一指针对应的冲突不存在或已在本批中被解决（即指针重复）、或同一条目同时给出 `choice` 与 `value`（显式 `null` 也算给出 `value`）→ 整批 **`400`**，同样无任何副作用。
 - `revision` 过期、合并单已 `resolved` → 与正式提交相同的 **`409`**；合并单不存在 → **`404`**。
 
-### 5. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 5. 规则批量裁决 — `POST /merges/{merge_id}/rule-resolutions`
+
+不想逐条枚举冲突指针时，可携带当前 `revision` 与一组**有序规则**，由服务把每条开放冲突分配给唯一规则后一次性裁决。每条规则给出 `left` 和/或 `right` 一个 [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) 风格的路径模式，命中即采用对应一侧的候选：
+
+- 普通路径与 JSON Pointer 写法一致（`~` 转义为 `~0`、`/` 转义为 `~1`，`""` 表示文档根）；
+- 单段 `*`：恰好匹配**一个**路径段，如 `/services/*/image`；
+- 末尾 `**`：匹配剩余的**零个或多个**路径段，如 `/services/**`；
+- 通配符必须独占整段，且 `**` 只能出现在最后一段（`/a/**/b`、`/a/x*` 均为非法模式 → `400`）。
+
+**唯一规则的选择次序**：对每个开放冲突，在所有命中它的模式中按以下优先级取最高者——
+
+1. **字面量段更多**（含字面量的段越多越优先）；
+2. **`*` 更少**（模式中 `*` 字符数更少：`*` 算 1 个、`**` 算 2 个）；
+3. **声明顺序更前**（请求 `rules` 数组中的下标更小）；
+4. 同一条规则内 `left` 优先于 `right`。
+
+```bash
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/rule-resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "rules": [
+      {"left":  "/services/*/image", "right": "/services/*/replicas"},
+      {"right": "/db/**"},
+      {"left":  "/**"}
+    ]
+  }'
+```
+
+响应在普通状态视图（`status` / `revision` / `document` / `conflicts` / `result`）之外，额外返回各规则命中的指针与未匹配冲突：
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "status": "pending",
+  "revision": 2,
+  "document": { "...": "..." },
+  "conflicts": [
+    {"pointer": "/feature/x", "base": 0, "left": 1, "right": 2, "missing": []}
+  ],
+  "conflict_count": 1,
+  "result": null,
+  "rule_matches": [
+    {"rule_index": 0, "side": "left",  "pointers": ["/services/api/image"]},
+    {"rule_index": 0, "side": "right", "pointers": ["/services/api/replicas"]},
+    {"rule_index": 1, "side": "right", "pointers": ["/db/host", "/db/port"]}
+  ],
+  "unmatched_conflicts": ["/feature/x"],
+  "applied": true,
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+- **先整批校验，再一次事务提交**：先编译全部模式、为每个冲突选定唯一规则，并验证所有命中项都可应用；只有全部通过时才在**单条 UPDATE 事务**中写入，`revision` 恰好 **+1**。任何非法模式、缺少 `left`/`right` 的规则、或任一命中项应用失败，整批 **`400`**，**不会产生任何部分修改**（revision 与冲突列表保持原样）。
+- **缺失侧沿用删除语义**：规则选中的一侧若处于删除态（冲突的 `missing` 中含该侧），则删除对应键；若缺失的是文档根本身（无法删除），整批 `400`。
+- **未匹配冲突**原样保留并通过 `unmatched_conflicts` 返回；它们不阻塞其余命中项的提交，但会使合并单继续处于 `pending`。
+- **一条都没命中**时不写入、不递增 revision（响应中 `applied: false`）；这不算错误，返回 `200`。
+- **revision 过期 → `409`**（响应体携带 `current_revision`）；合并单已 `resolved` 后同样 `409`；合并单不存在 → `404`。
+
+### 6. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -201,7 +261,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（36 项）
+python -m pytest tests/ -q                  # 运行测试（72 项）
 ```
 
 ## 项目结构
@@ -210,6 +270,7 @@ python -m pytest tests/ -q                  # 运行测试（36 项）
 app/
   main.py    # FastAPI 路由与错误映射（404/409/400）
   merge.py   # 纯 Python 三方合并引擎（JSON Pointer 递归）
+  rules.py   # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   patch.py   # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   store.py   # 合并单状态机：revision 校验、冲突解决、不可变结果
   db.py      # SQLite 连接与建表（启动时执行）
